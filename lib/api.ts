@@ -127,68 +127,71 @@ export async function scrapeSeriesDetail(slug: string): Promise<ScrapedSeriesDet
       next: { revalidate: 3600 },
     })
     if (!res.ok) return {}
-    const text = await res.text()
+    const html = await res.text()
 
-    // 1. Thumbnail
-    // og:image hanya valid jika bukan logo situs (cropped-KOMIK7.png)
-    // Prioritas: gambar pertama di body (![alt](url.jpg))
+    // 1. Thumbnail — dari og:image (paling reliable)
     let thumbnail: string | undefined
-    const bodyImgMatch = text.match(/!\[[^\]]*\]\((https?:\/\/[^\s)"]+\.(?:jpg|jpeg|png|webp))/i)
-    if (bodyImgMatch) {
-      thumbnail = bodyImgMatch[1]
-    } else {
-      // fallback og:image jika bukan logo
-      const ogMatch = text.match(/meta-og:image:\s*(https:\/\/\S+\.(?:jpg|jpeg|png|webp))/i)
-      if (ogMatch && !ogMatch[1].includes('cropped-KOMIK7')) {
-        thumbnail = ogMatch[1].trim()
-      }
+    const ogImageMatch = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/)
+    if (ogImageMatch) thumbnail = ogImageMatch[1]
+
+    // 2. Type — dari link filter type di halaman
+    //    Contoh: href="...?order=title&type=Manhwa"
+    let mangaType: string | undefined
+    const typeMatch = html.match(/\?order=title&(?:amp;)?type=(Manga|Manhwa|Manhua)/i)
+    if (typeMatch) mangaType = typeMatch[1]
+    // fallback: cek teks "Tipe [Manhwa]"
+    if (!mangaType) {
+      const tipeTeksMatch = html.match(/Tipe\s*<[^>]+>(Manga|Manhwa|Manhua)<\/a>/i)
+      if (tipeTeksMatch) mangaType = tipeTeksMatch[1]
     }
 
-    // 2. Type dari "Tipe [Manhwa](...)"
-    let mangaType: string | undefined
-    const typeMatch = text.match(/Tipe\s*\[(Manga|Manhwa|Manhua)\]/i)
-    if (typeMatch) mangaType = typeMatch[1]
-
-    // 3. Sinopsis dari "## Sinopsis Komik ..."
+    // 3. Sinopsis — teks di bawah heading "Sinopsis ..."
+    //    Pola: <h2>Sinopsis ...</h2> ... <p>teks sinopsis</p>
     let sinopsis: string | undefined
-    const sinopsisMatch = text.match(/##\s*Sinopsis[^\n]*\n+([^#\n][^\n]+(?:\n(?![#*\n])[^\n]+)*)/i)
-    if (sinopsisMatch) {
-      sinopsis = sinopsisMatch[1]
-        .replace(/\*\*[^*]+\*\*/g, "")
-        .replace(/\[[^\]]+\]\([^)]+\)/g, "")
+    const sinopsisBlockMatch = html.match(
+      /(?:Sinopsis|Synopsis)[^<]*<\/h[23]>\s*([\s\S]*?)(?=<h[23]|<div class="chapter|<section|<div id="chapter)/i
+    )
+    if (sinopsisBlockMatch) {
+      sinopsis = sinopsisBlockMatch[1]
+        .replace(/<[^>]+>/g, " ")
         .replace(/\s+/g, " ")
         .trim()
-      if (sinopsis.length < 15) sinopsis = undefined
+      sinopsis = decodeHtml(sinopsis)
+      if (sinopsis.length < 10) sinopsis = undefined
     }
-    // fallback meta-description (jika bukan deskripsi situs)
+    // fallback: meta description
     if (!sinopsis) {
-      const metaDescMatch = text.match(/meta-description:\s*([^\n]+)/i)
-      if (metaDescMatch && !metaDescMatch[1].includes('website baca komik')) {
-        sinopsis = metaDescMatch[1].trim()
-      }
+      const metaDescMatch = html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/)
+      if (metaDescMatch) sinopsis = decodeHtml(metaDescMatch[1])
     }
 
-    // 4. Score dari "Bookmark\n\n6.7\n\nStatus"
+    // 4. Score — angka di halaman (biasanya muncul setelah bookmark)
     let score: string | undefined
-    const scoreMatch = text.match(/Bookmark\s*\n+(\d+(?:\.\d+)?)\s*\n/i)
+    const scoreMatch = html.match(/>\s*(\d+(?:\.\d+)?)\s*<\/(?:span|div|p)[^>]*>\s*(?:Status|Tipe)/i)
     if (scoreMatch) score = scoreMatch[1]
 
-    // 5. Status dari "Status *Ongoing*"
+    // 5. Status — "Ongoing" / "Completed"
     let status: string | undefined
-    const statusMatch = text.match(/Status\s*\*(Ongoing|Completed|Hiatus)\*/i)
+    const statusMatch = html.match(/Status\s*<\/(?:b|strong|span)[^>]*>\s*<(?:em|span|a)[^>]*>\s*(Ongoing|Completed|Hiatus)/i)
     if (statusMatch) status = statusMatch[1]
+    if (!status) {
+      const statusMatch2 = html.match(/Status[^<]*<\/[^>]+>\s*<[^>]+>\s*(Ongoing|Completed|Hiatus)/i)
+      if (statusMatch2) status = statusMatch2[1]
+    }
 
     // 6. Author & Artist
     let author: string | undefined
     let artist: string | undefined
-    const authorMatch = text.match(/\*\*Penulis\*\*\s+([^\n\[]+?)(?:\s*\[|\s*\n)/i)
-    if (authorMatch) author = authorMatch[1].trim()
-    const artistMatch = text.match(/\*\*Artist\*\*\s+([^\n\[]+?)(?:\s*\[|\s*\n)/i)
-    if (artistMatch) artist = artistMatch[1].trim()
+    const authorMatch = html.match(/Penulis\s*<\/[^>]+>\s*<[^>]+>([^<]+)</)
+    if (authorMatch) author = decodeHtml(authorMatch[1].trim())
+    const artistMatch = html.match(/Artist\s*<\/[^>]+>\s*<[^>]+>([^<]+)</)
+    if (artistMatch) artist = decodeHtml(artistMatch[1].trim())
 
-    // 7. Genre dari "[Action](https://...genres/action/)"
-    const genreMatches = [...text.matchAll(/\[([A-Za-z ]+)\]\(https?:\/\/[^)]*\/genres\/[^)]+\)/gi)]
-    const genres = [...new Set(genreMatches.map(m => m[1].trim()).filter(g => g.length > 1 && g.length < 30))]
+    // 7. Genre — dari link /genres/[slug]/
+    const genreMatches = [...html.matchAll(/\/genres\/([^/]+)\/[^>]*>([^<]+)</gi)]
+    const genres = genreMatches
+      .map(m => decodeHtml(m[2].trim()))
+      .filter(g => g.length > 0 && g.length < 30)
 
     return { mangaType, sinopsis, thumbnail, score, status, author, artist, genres }
   } catch {
@@ -311,6 +314,9 @@ export async function getSeriesBySlug(slug: string): Promise<Series> {
     status: detail.status,
     author: detail.author,
     artist: detail.artist,
+    genres: detail.genres
+      ? detail.genres.map((name, i) => ({ id: i, name, slug: name.toLowerCase().replace(/\s+/g, "-"), count: 0 }))
+      : undefined,
   }
 }
 
@@ -330,6 +336,9 @@ export async function getSeries(id: number): Promise<Series> {
       status: detail.status,
       author: detail.author,
       artist: detail.artist,
+      genres: detail.genres
+        ? detail.genres.map((name, i) => ({ id: i, name, slug: name.toLowerCase().replace(/\s+/g, "-"), count: 0 }))
+        : undefined,
     }
   }
   return base
