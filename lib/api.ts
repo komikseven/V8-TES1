@@ -127,71 +127,68 @@ export async function scrapeSeriesDetail(slug: string): Promise<ScrapedSeriesDet
       next: { revalidate: 3600 },
     })
     if (!res.ok) return {}
-    const html = await res.text()
+    const text = await res.text()
 
-    // 1. Thumbnail — dari og:image (paling reliable)
+    // 1. Thumbnail
+    // og:image hanya valid jika bukan logo situs (cropped-KOMIK7.png)
+    // Prioritas: gambar pertama di body (![alt](url.jpg))
     let thumbnail: string | undefined
-    const ogImageMatch = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/)
-    if (ogImageMatch) thumbnail = ogImageMatch[1]
-
-    // 2. Type — dari link filter type di halaman
-    //    Contoh: href="...?order=title&type=Manhwa"
-    let mangaType: string | undefined
-    const typeMatch = html.match(/\?order=title&(?:amp;)?type=(Manga|Manhwa|Manhua)/i)
-    if (typeMatch) mangaType = typeMatch[1]
-    // fallback: cek teks "Tipe [Manhwa]"
-    if (!mangaType) {
-      const tipeTeksMatch = html.match(/Tipe\s*<[^>]+>(Manga|Manhwa|Manhua)<\/a>/i)
-      if (tipeTeksMatch) mangaType = tipeTeksMatch[1]
+    const bodyImgMatch = text.match(/!\[[^\]]*\]\((https?:\/\/[^\s)"]+\.(?:jpg|jpeg|png|webp))/i)
+    if (bodyImgMatch) {
+      thumbnail = bodyImgMatch[1]
+    } else {
+      // fallback og:image jika bukan logo
+      const ogMatch = text.match(/meta-og:image:\s*(https:\/\/\S+\.(?:jpg|jpeg|png|webp))/i)
+      if (ogMatch && !ogMatch[1].includes('cropped-KOMIK7')) {
+        thumbnail = ogMatch[1].trim()
+      }
     }
 
-    // 3. Sinopsis — teks di bawah heading "Sinopsis ..."
-    //    Pola: <h2>Sinopsis ...</h2> ... <p>teks sinopsis</p>
+    // 2. Type dari "Tipe [Manhwa](...)"
+    let mangaType: string | undefined
+    const typeMatch = text.match(/Tipe\s*\[(Manga|Manhwa|Manhua)\]/i)
+    if (typeMatch) mangaType = typeMatch[1]
+
+    // 3. Sinopsis dari "## Sinopsis Komik ..."
     let sinopsis: string | undefined
-    const sinopsisBlockMatch = html.match(
-      /(?:Sinopsis|Synopsis)[^<]*<\/h[23]>\s*([\s\S]*?)(?=<h[23]|<div class="chapter|<section|<div id="chapter)/i
-    )
-    if (sinopsisBlockMatch) {
-      sinopsis = sinopsisBlockMatch[1]
-        .replace(/<[^>]+>/g, " ")
+    const sinopsisMatch = text.match(/##\s*Sinopsis[^\n]*\n+([^#\n][^\n]+(?:\n(?![#*\n])[^\n]+)*)/i)
+    if (sinopsisMatch) {
+      sinopsis = sinopsisMatch[1]
+        .replace(/\*\*[^*]+\*\*/g, "")
+        .replace(/\[[^\]]+\]\([^)]+\)/g, "")
         .replace(/\s+/g, " ")
         .trim()
-      sinopsis = decodeHtml(sinopsis)
-      if (sinopsis.length < 10) sinopsis = undefined
+      if (sinopsis.length < 15) sinopsis = undefined
     }
-    // fallback: meta description
+    // fallback meta-description (jika bukan deskripsi situs)
     if (!sinopsis) {
-      const metaDescMatch = html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/)
-      if (metaDescMatch) sinopsis = decodeHtml(metaDescMatch[1])
+      const metaDescMatch = text.match(/meta-description:\s*([^\n]+)/i)
+      if (metaDescMatch && !metaDescMatch[1].includes('website baca komik')) {
+        sinopsis = metaDescMatch[1].trim()
+      }
     }
 
-    // 4. Score — angka di halaman (biasanya muncul setelah bookmark)
+    // 4. Score dari "Bookmark\n\n6.7\n\nStatus"
     let score: string | undefined
-    const scoreMatch = html.match(/>\s*(\d+(?:\.\d+)?)\s*<\/(?:span|div|p)[^>]*>\s*(?:Status|Tipe)/i)
+    const scoreMatch = text.match(/Bookmark\s*\n+(\d+(?:\.\d+)?)\s*\n/i)
     if (scoreMatch) score = scoreMatch[1]
 
-    // 5. Status — "Ongoing" / "Completed"
+    // 5. Status dari "Status *Ongoing*"
     let status: string | undefined
-    const statusMatch = html.match(/Status\s*<\/(?:b|strong|span)[^>]*>\s*<(?:em|span|a)[^>]*>\s*(Ongoing|Completed|Hiatus)/i)
+    const statusMatch = text.match(/Status\s*\*(Ongoing|Completed|Hiatus)\*/i)
     if (statusMatch) status = statusMatch[1]
-    if (!status) {
-      const statusMatch2 = html.match(/Status[^<]*<\/[^>]+>\s*<[^>]+>\s*(Ongoing|Completed|Hiatus)/i)
-      if (statusMatch2) status = statusMatch2[1]
-    }
 
     // 6. Author & Artist
     let author: string | undefined
     let artist: string | undefined
-    const authorMatch = html.match(/Penulis\s*<\/[^>]+>\s*<[^>]+>([^<]+)</)
-    if (authorMatch) author = decodeHtml(authorMatch[1].trim())
-    const artistMatch = html.match(/Artist\s*<\/[^>]+>\s*<[^>]+>([^<]+)</)
-    if (artistMatch) artist = decodeHtml(artistMatch[1].trim())
+    const authorMatch = text.match(/\*\*Penulis\*\*\s+([^\n\[]+?)(?:\s*\[|\s*\n)/i)
+    if (authorMatch) author = authorMatch[1].trim()
+    const artistMatch = text.match(/\*\*Artist\*\*\s+([^\n\[]+?)(?:\s*\[|\s*\n)/i)
+    if (artistMatch) artist = artistMatch[1].trim()
 
-    // 7. Genre — dari link /genres/[slug]/
-    const genreMatches = [...html.matchAll(/\/genres\/([^/]+)\/[^>]*>([^<]+)</gi)]
-    const genres = genreMatches
-      .map(m => decodeHtml(m[2].trim()))
-      .filter(g => g.length > 0 && g.length < 30)
+    // 7. Genre dari "[Action](https://...genres/action/)"
+    const genreMatches = [...text.matchAll(/\[([A-Za-z ]+)\]\(https?:\/\/[^)]*\/genres\/[^)]+\)/gi)]
+    const genres = [...new Set(genreMatches.map(m => m[1].trim()).filter(g => g.length > 1 && g.length < 30))]
 
     return { mangaType, sinopsis, thumbnail, score, status, author, artist, genres }
   } catch {
@@ -291,20 +288,21 @@ export const fetcher = async (url: string) => {
 const POST_FIELDS = "id,title,link,date,meta,categories,content"
 
 /**
- * Single series by slug — data dasar dari WP API + scrape detail HTML
- * Ini fungsi UTAMA untuk halaman detail komik
+ * Ambil detail series via /api/scrape-detail (server route).
+ * Dipanggil dari client (useSWR) — server yang akses komik7.my.id,
+ * sehingga tidak kena blokir CORS/hotlink dari browser.
  */
-export async function getSeriesBySlug(slug: string): Promise<Series> {
-  // 1. Data dasar dari WP categories API
-  const url = `${API_BASE}/categories?slug=${encodeURIComponent(slug)}&per_page=1`
-  const data = await fetcher(url)
-  const arr = data as RawCategory[]
-  if (!arr.length) throw new Error(`Series "${slug}" tidak ditemukan`)
-  const base = parseSeries(arr[0])
+async function fetchSeriesDetail(slug: string): Promise<ScrapedSeriesDetail> {
+  try {
+    const res = await fetch(`/api/scrape-detail?slug=${encodeURIComponent(slug)}`)
+    if (!res.ok) return {}
+    return await res.json()
+  } catch {
+    return {}
+  }
+}
 
-  // 2. Scrape halaman HTML untuk type & sinopsis yang akurat
-  const detail = await scrapeSeriesDetail(slug)
-
+function applyDetail(base: Series, detail: ScrapedSeriesDetail): Series {
   return {
     ...base,
     mangaType: detail.mangaType,
@@ -315,31 +313,37 @@ export async function getSeriesBySlug(slug: string): Promise<Series> {
     author: detail.author,
     artist: detail.artist,
     genres: detail.genres
-      ? detail.genres.map((name, i) => ({ id: i, name, slug: name.toLowerCase().replace(/\s+/g, "-"), count: 0 }))
+      ? detail.genres.map((name, i) => ({
+          id: i,
+          name,
+          slug: name.toLowerCase().replace(/\s+/g, "-"),
+          count: 0,
+        }))
       : undefined,
   }
+}
+
+/**
+ * Single series by slug — data dasar dari WP API + scrape detail via server route.
+ * Ini fungsi UTAMA untuk halaman detail komik.
+ */
+export async function getSeriesBySlug(slug: string): Promise<Series> {
+  const url = `${API_BASE}/categories?slug=${encodeURIComponent(slug)}&per_page=1`
+  const data = await fetcher(url)
+  const arr = data as RawCategory[]
+  if (!arr.length) throw new Error(`Series "${slug}" tidak ditemukan`)
+  const base = parseSeries(arr[0])
+  const detail = await fetchSeriesDetail(slug)
+  return applyDetail(base, detail)
 }
 
 export async function getSeries(id: number): Promise<Series> {
   const url = `${API_BASE}/categories/${id}`
   const data = await fetcher(url)
   const base = parseSeries(data as RawCategory)
-  // Scrape detail jika ada slug
   if (base.slug) {
-    const detail = await scrapeSeriesDetail(base.slug)
-    return {
-      ...base,
-      mangaType: detail.mangaType,
-      description: detail.sinopsis || base.description,
-      thumbnail: detail.thumbnail || base.thumbnail,
-      score: detail.score,
-      status: detail.status,
-      author: detail.author,
-      artist: detail.artist,
-      genres: detail.genres
-        ? detail.genres.map((name, i) => ({ id: i, name, slug: name.toLowerCase().replace(/\s+/g, "-"), count: 0 }))
-        : undefined,
-    }
+    const detail = await fetchSeriesDetail(base.slug)
+    return applyDetail(base, detail)
   }
   return base
 }
